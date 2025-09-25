@@ -4,6 +4,8 @@ import torchaudio
 from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 import numpy as np
+# Asegurarse de usar el backend correcto
+torchaudio.set_audio_backend("sox_io")
 
 class CustomSpeechCommands(Dataset):
     def __init__(self, root, files_list, download=False): # cambiar esto a true si no se tiene el dataset
@@ -26,9 +28,10 @@ class CustomSpeechCommands(Dataset):
             full_path = item
             # Convertir a formato relativo (como en los archivos .txt)
             relative_path = os.path.relpath(full_path, start=os.path.join(root, "SpeechCommands", "speech_commands_v0.02"))
+            relative_path = relative_path.replace("\\", "/")
             # En Windows, convertir barras invertidas a normales
             self.all_paths.append(relative_path)
-        
+
         print(f"Primeros 3 paths normalizados del dataset: {self.all_paths[:3]}")
         
         # Crear máscara para filtrar los archivos de tu partición
@@ -79,7 +82,7 @@ try:
     
     # Plotear la primera muestra del train dataset
     if len(train_dataset) > 0:
-        waveform, sample_rate, label, speaker_id, utterance_number = train_dataset[2]
+        waveform, sample_rate, label, speaker_id, utterance_number = train_dataset[15000]
         
         # Convertir a numpy y eliminar la dimensión del canal
         wave = waveform.squeeze().numpy()  # .squeeze() elimina dimensiones de tamaño 1
@@ -105,6 +108,21 @@ try:
         print(f"Duración: {duration:.2f} segundos")
         print(f"Sample rate: {sample_rate} Hz")
         print(f"Tamaño del waveform: {waveform.shape}")
+
+        # Aplicar transformación MFCC
+        mfcc_transform = torchaudio.transforms.MFCC(
+            sample_rate=sample_rate,
+            n_mfcc=13,
+            melkwargs={"n_fft": 400, "hop_length": 160, "n_mels": 23}
+        )
+        mfcc = mfcc_transform(waveform)
+        print(f"Shape of MFCC: {mfcc.shape}")
+        plt.figure(figsize=(10, 4))
+        plt.imshow(mfcc[0].detach().numpy(), cmap='hot', aspect='auto')
+        plt.title("MFCC")
+        plt.colorbar()
+        plt.tight_layout()
+        plt.show()
         
 except Exception as e:
     print(f"Error: {e}")
