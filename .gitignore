@@ -6,6 +6,12 @@ __pycache__/
 # Entorno Virtual
 proyecto/
 .vscode
+
+# Datasets
+data/test_features.pkl
+data/val_features.pkl
+data/train_features.pkl
+
 # C extensions
 *.so
 SpeechCommands/
