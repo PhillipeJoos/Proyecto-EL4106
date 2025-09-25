@@ -5,10 +5,11 @@ __pycache__/
 
 # Entorno Virtual
 proyecto/
-
+.vscode
 # C extensions
 *.so
-
+SpeechCommands/
+data/speech_commands_v0.02.tar.gz
 # Distribution / packaging
 .Python
 build/
