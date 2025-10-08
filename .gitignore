@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 # Entorno Virtual
+main_exported.py
 proyecto/
 .vscode
 
