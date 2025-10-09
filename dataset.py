@@ -81,6 +81,7 @@ class CustomSpeechCommands(Dataset):
                 waveform = self.pad_waveform(waveform).to(device)
 
                 feat = feature_extractor(waveform).squeeze(0).cpu()
+                feat = feat.transpose(0, 1)  # [T, n_mfcc] → ahora input_size=13
                 features.append(feat)
                 labels.append(label)
 
