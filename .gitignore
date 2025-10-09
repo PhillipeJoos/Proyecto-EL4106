@@ -12,7 +12,7 @@ proyecto/
 data/test_features.pkl
 data/val_features.pkl
 data/train_features.pkl
-
+*.pt
 # C extensions
 *.so
 SpeechCommands/

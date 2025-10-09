@@ -21,6 +21,10 @@ class CustomSpeechCommands(Dataset):
         )
         self.indices = None
         self.splitter(files_list, root)
+        self.OFFICIAL_CLASSES = [
+        "yes", "no", "up", "down", "left", "right",
+        "on", "off", "stop", "go"
+        ]
 
     def splitter(self, files_list, root):
         with open(files_list, 'r') as f:
@@ -85,12 +89,22 @@ class CustomSpeechCommands(Dataset):
         print(f"Features tensor: {features.shape}")  # [N, n_mfcc, T]
         return features, labels
 
+
     def save_features(self, feature_extractor, save_path, device="cpu"):
+        """
+        Extrae y guarda features, reemplazando clases no oficiales por 'unknown'.
+        """
         print(f"Guardando features en: {save_path}")
         try:
             features, labels = self.extract_features(feature_extractor, device=device)
-            torch.save({"features": features, "labels": labels}, save_path)
+            processed_labels = [
+                label if label in self.OFFICIAL_CLASSES else "unknown"
+                for label in labels
+            ]
+            torch.save({"features": features, "labels": processed_labels}, save_path)
             print(f"Features guardadas correctamente en {save_path}")
+            print(f"Clases finales: {set(processed_labels)}")
+
         except Exception as e:
             print(f"Error al guardar features en {save_path}: {e}")
 

@@ -6,7 +6,7 @@ class RNNModel(nn.Module):
         rnn_type,
         n_input_channels,
         hidd_size=256,
-        out_features = 3,
+        out_features = 11,
         num_layers=1,
     ):
         """
