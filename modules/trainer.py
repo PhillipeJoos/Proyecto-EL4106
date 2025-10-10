@@ -2,6 +2,8 @@ import torch
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
 
 def train_step(x_batch, y_batch, model, optimizer, criterion, use_gpu):
     # Predicción
@@ -134,8 +136,9 @@ def train_model(
 
 def show_curves(all_curves):
 
-    final_curve_means = {k: np.mean([c[k] for c in all_curves], axis=0) for k in all_curves[0].keys()}
-    final_curve_stds = {k: np.std([c[k] for c in all_curves], axis=0) for k in all_curves[0].keys()}
+    # Corrected to handle a single dictionary of lists
+    final_curve_means = {k: np.array(v) for k, v in all_curves.items()}
+    final_curve_stds = {k: np.zeros_like(v) for k, v in all_curves.items()} # No std for a single run
 
     fig, ax = plt.subplots(1, 2, figsize=(13, 5))
     fig.set_facecolor('white')
@@ -144,8 +147,7 @@ def show_curves(all_curves):
 
     ax[0].plot(epochs, final_curve_means['val_loss'], label='validation')
     ax[0].plot(epochs, final_curve_means['train_loss'], label='training')
-    ax[0].fill_between(epochs, y1=final_curve_means["val_loss"] - final_curve_stds["val_loss"], y2=final_curve_means["val_loss"] + final_curve_stds["val_loss"], alpha=.5)
-    ax[0].fill_between(epochs, y1=final_curve_means["train_loss"] - final_curve_stds["train_loss"], y2=final_curve_means["train_loss"] + final_curve_stds["train_loss"], alpha=.5)
+    # Removed fill_between as std is zero for a single run
     ax[0].set_xlabel('Epoch')
     ax[0].set_ylabel('Loss')
     ax[0].set_title('Loss evolution during training')
@@ -153,11 +155,130 @@ def show_curves(all_curves):
 
     ax[1].plot(epochs, final_curve_means['val_acc'], label='validation')
     ax[1].plot(epochs, final_curve_means['train_acc'], label='training')
-    ax[1].fill_between(epochs, y1=final_curve_means["val_acc"] - final_curve_stds["val_acc"], y2=final_curve_means["val_acc"] + final_curve_stds["val_acc"], alpha=.5)
-    ax[1].fill_between(epochs, y1=final_curve_means["train_acc"] - final_curve_stds["train_acc"], y2=final_curve_means["train_acc"] + final_curve_stds["train_acc"], alpha=.5)
+    # Removed fill_between as std is zero for a single run
     ax[1].set_xlabel('Epoch')
     ax[1].set_ylabel('Accuracy')
     ax[1].set_title('Accuracy evolution during training')
     ax[1].legend()
 
     plt.show()
+
+def evaluate_with_std(model, dataloader, criterion, use_gpu=True):
+    # jaja std
+    if use_gpu:
+        model.cuda()
+
+    all_losses = []
+    all_accuracies = []
+
+    with torch.no_grad():
+        for X, y in dataloader:
+            if use_gpu:
+                X, y = X.cuda(non_blocking=True), y.cuda(non_blocking=True)
+
+            outputs = model(X)
+            loss = criterion(outputs, y)
+            all_losses.append(loss.item())
+
+            preds = outputs.argmax(dim=1)
+            acc = (preds == y).float().mean().item()
+            all_accuracies.append(acc)
+
+    mean_loss = np.mean(all_losses)
+    std_loss = np.std(all_losses)
+    mean_acc = np.mean(all_accuracies)
+    std_acc = np.std(all_accuracies)
+
+    model.cpu()
+
+    return mean_acc, std_acc, mean_loss, std_loss
+
+def confusion_matrix(model, dataloader, num_classes, use_gpu = True):
+    confusion_matrix = torch.zeros(num_classes, num_classes)
+    model.eval()
+    with torch.no_grad():
+        for X, y in dataloader:
+            if use_gpu:
+                X, y = X.cuda(), y.cuda()
+            outputs = model(X)
+            _, preds = torch.max(outputs, 1)
+            for t, p in zip(y.view(-1), preds.view(-1)):
+                confusion_matrix[t.long(), p.long()] += 1
+    return confusion_matrix
+
+def confusion_matrix_display(tags, models, test_loader, class_names, use_gpu=True):
+    for name, model in zip(tags, models):
+        cm = confusion_matrix(model, test_loader, len(class_names), use_gpu)
+        cm_np = cm.cpu().numpy()
+
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm_np, annot=True, fmt=".0f", cmap="Blues",
+                    xticklabels=class_names, yticklabels=class_names)
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        plt.title(f'Confusion Matrix - {name}')
+        plt.show()
+
+
+def evaluate_models_metrics(models, dataloader, criterion, use_gpu=True):
+    """
+    Evalúa múltiples modelos y calcula métricas promedio y desviación estándar.
+    Retorna un diccionario con accuracy, recall, precision, f1 y loss.
+    """
+
+    # Diccionarios para guardar resultados
+    all_metrics = {
+        "accuracy": [],
+        "recall": [],
+        "precision": [],
+        "f1": [],
+        "loss": [],
+    }
+
+    for model in models:
+        model.eval()
+        if use_gpu:
+            model.cuda()
+
+        y_true = []
+        y_pred = []
+        losses = []
+
+        with torch.no_grad():
+            for X, y in dataloader:
+                if use_gpu:
+                    X, y = X.cuda(non_blocking=True), y.cuda(non_blocking=True)
+
+                outputs = model(X)
+                loss = criterion(outputs, y)
+                losses.append(loss.item())
+
+                preds = outputs.argmax(dim=1)
+                y_true.extend(y.cpu().numpy())
+                y_pred.extend(preds.cpu().numpy())
+
+        # Cálculo de métricas
+        acc = accuracy_score(y_true, y_pred)
+        rec = recall_score(y_true, y_pred, average='macro', zero_division=0)
+        prec = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        loss_mean = np.mean(losses)
+
+        # Guardar métricas
+        all_metrics["accuracy"].append(acc)
+        all_metrics["recall"].append(rec)
+        all_metrics["precision"].append(prec)
+        all_metrics["f1"].append(f1)
+        all_metrics["loss"].append(loss_mean)
+
+        model.cpu()
+
+    # Calcular medias y desviaciones estándar
+    metrics_mean = {k: np.mean(v) for k, v in all_metrics.items()}
+    metrics_std = {k: np.std(v) for k, v in all_metrics.items()}
+
+    print("\n=== Resultados promedio sobre modelos ===")
+    for metric in all_metrics.keys():
+        print(f"{metric.capitalize():<10}: {metrics_mean[metric]:.4f} +/- {metrics_std[metric]:.4f}")
+
+    return metrics_mean, metrics_std, all_metrics
