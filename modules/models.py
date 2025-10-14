@@ -25,7 +25,7 @@ class RNNModel(nn.Module):
             self.rnn_layer = nn.LSTM(n_input_channels, hidd_size, batch_first=True, num_layers=num_layers)
 
         elif rnn_type == "RNN":
-            self.rnn_layer = nn.RNN(n_input_channels, hidd_size, batch_first=True, num_layers=num_layers)
+            self.rnn_layer = nn.RNN(n_input_channels, hidd_size, batch_first=True, num_layers=num_layers, bidirectional=True)
 
         else:
             raise ValueError(f"rnn_type {rnn_type} not supported.")

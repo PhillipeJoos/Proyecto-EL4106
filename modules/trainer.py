@@ -4,6 +4,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
+import os
+import re
 
 def train_step(x_batch, y_batch, model, optimizer, criterion, use_gpu):
     # Predicción
@@ -223,7 +225,7 @@ def confusion_matrix_display(tags, models, test_loader, class_names, use_gpu=Tru
 def evaluate_models_metrics(models, dataloader, criterion, use_gpu=True):
     """
     Evalúa múltiples modelos y calcula métricas promedio y desviación estándar.
-    Retorna un diccionario con accuracy, recall, precision, f1 y loss.
+    Retorna un diccionario con accuracy, recall, precision y f1
     """
 
     # Diccionarios para guardar resultados
@@ -232,7 +234,6 @@ def evaluate_models_metrics(models, dataloader, criterion, use_gpu=True):
         "recall": [],
         "precision": [],
         "f1": [],
-        "loss": [],
     }
 
     for model in models:
@@ -269,9 +270,11 @@ def evaluate_models_metrics(models, dataloader, criterion, use_gpu=True):
         all_metrics["recall"].append(rec)
         all_metrics["precision"].append(prec)
         all_metrics["f1"].append(f1)
-        all_metrics["loss"].append(loss_mean)
 
-        model.cpu()
+        if use_gpu:
+            model.cuda()
+        else:
+            model.cpu()
 
     # Calcular medias y desviaciones estándar
     metrics_mean = {k: np.mean(v) for k, v in all_metrics.items()}
@@ -281,4 +284,103 @@ def evaluate_models_metrics(models, dataloader, criterion, use_gpu=True):
     for metric in all_metrics.keys():
         print(f"{metric.capitalize():<10}: {metrics_mean[metric]:.4f} +/- {metrics_std[metric]:.4f}")
 
-    return metrics_mean, metrics_std, all_metrics
+    print("\n=== Detalles por modelo ===")
+    for i, model in enumerate(models):
+        print(f"\n=== Modelo {i + 1} ({model.rnn_type}) ===")
+        for metric in all_metrics.keys():
+            print(f"{metric.capitalize():<10}: {all_metrics[metric][i]:.4f} +/- {metrics_std[metric]:.4f}")
+
+    # return metrics_mean, metrics_std, all_metrics
+    return
+
+def nfft_hop_length_exp(n_trains, feature_xtractor):
+    
+    # ======== Estructuras de resultados ========
+    results = {}  # {(nfft, hl): [accuracies]}
+    times_of_training = {}
+    models = {}
+
+    # ======== Obtener combinaciones de archivos ========
+    base_dir = os.path.join('data', 'petes')  # o 'data' si están en esa carpeta
+    files = os.listdir(base_dir)
+
+    # Extraer parámetros nfft y hop_length de los nombres
+    pattern = re.compile(r'n(\d+)_hl(\d+)')
+    pairs = sorted(list({pattern.search(f).groups() for f in files if pattern.search(f)}))
+
+    # ======== Loop sobre combinaciones ========
+    for nfft, hl in pairs:
+        nfft = int(nfft)
+        hl = int(hl)
+        print(f"\n=== Entrenando para nfft={nfft}, hop_length={hl} ===")
+
+        # Cargar datasets
+        train_dataset = feature_xtractor(os.path.join(base_dir, f'train_n{nfft}_hl{hl}.pt'))
+        test_dataset = feature_xtractor(os.path.join(base_dir, f'test_n{nfft}_hl{hl}.pt'))
+        val_dataset = feature_xtractor(os.path.join(base_dir, f'val_n{nfft}_hl{hl}.pt'))
+
+        accs = []
+        train_times = []
+
+        for k in range(n_trains):
+            print(f'  Entrenando modelo {k+1}/{n_trains}')
+            model = RNNModel(rnn_type='RNN', n_input_channels=13, hidd_size=128)
+            all_curves, times = train_model(
+                model, train_dataset, val_dataset, epochs, criterion,
+                batch_size, lr, n_evaluations_per_epoch=3, use_gpu=use_gpu
+            )
+
+            val_acc = all_curves["val_acc"][-1]  # o la métrica final que uses
+            accs.append(val_acc)
+            train_times.append(times)
+            models[(nfft, hl, k)] = model
+
+        results[(nfft, hl)] = accs
+        times_of_training[(nfft, hl)] = train_times
+
+    # ======== Graficar resultados ========
+    # === Procesar los resultados ===
+    nfft_vals = sorted(set(k[0] for k in results.keys()))
+    hl_vals   = sorted(set(k[1] for k in results.keys()))
+
+    # Crear matrices de promedio y desviación estándar
+    mean_matrix = np.zeros((len(hl_vals), len(nfft_vals)))
+    std_matrix  = np.zeros((len(hl_vals), len(nfft_vals)))
+
+    for i, hl in enumerate(hl_vals):
+        for j, nfft in enumerate(nfft_vals):
+            if (nfft, hl) in results:
+                vals = np.array(results[(nfft, hl)])
+                mean_matrix[i, j] = np.mean(vals)
+                std_matrix[i, j]  = np.std(vals)
+            else:
+                mean_matrix[i, j] = np.nan
+                std_matrix[i, j]  = np.nan
+
+    # === Graficar el mapa de calor ===
+    plt.figure(figsize=(8, 6))
+    im = plt.imshow(mean_matrix, cmap='viridis', origin='lower', aspect='auto')
+
+    # Etiquetas
+    plt.xticks(range(len(nfft_vals)), nfft_vals)
+    plt.yticks(range(len(hl_vals)), hl_vals)
+    plt.xlabel('n_fft')
+    plt.ylabel('hop_length')
+    plt.title('Accuracy promedio ± desviación (5 entrenamientos por configuración)')
+
+    # Barra de color
+    cbar = plt.colorbar(im)
+    cbar.set_label('Accuracy promedio')
+
+    # Mostrar valores promedio ± std en cada celda
+    for i in range(len(hl_vals)):
+        for j in range(len(nfft_vals)):
+            mean_val = mean_matrix[i, j]
+            std_val  = std_matrix[i, j]
+            if not np.isnan(mean_val):
+                color = 'white' if mean_val < 0.7 else 'black'
+                plt.text(j, i, f"{mean_val:.2f}\n+/-{std_val:.4f}", 
+                        ha='center', va='center', color=color, fontsize=8)
+
+    plt.tight_layout()
+    plt.show()
