@@ -20,6 +20,7 @@ data/speech_commands_v0.02.tar.gz
 # Distribution / packaging
 .Python
 build/
+img/
 develop-eggs/
 dist/
 downloads/

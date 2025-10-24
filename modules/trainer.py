@@ -3,7 +3,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
+from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, confusion_matrix
 import os
 import re
 
@@ -136,34 +136,128 @@ def train_model(
 
     return curves, total_time
 
-def show_curves(all_curves):
-
-    # Corrected to handle a single dictionary of lists
-    final_curve_means = {k: np.array(v) for k, v in all_curves.items()}
-    final_curve_stds = {k: np.zeros_like(v) for k, v in all_curves.items()} # No std for a single run
+def show_curves(all_curves, suptitle=''):
+    final_curve_means = {k: np.mean([c[k] for c in all_curves], axis=0) for k in all_curves[0].keys()}
+    final_curve_stds = {k: np.std([c[k] for c in all_curves], axis=0) for k in all_curves[0].keys()}
 
     fig, ax = plt.subplots(1, 2, figsize=(13, 5))
     fig.set_facecolor('white')
 
     epochs = np.arange(len(final_curve_means["val_loss"])) + 1
 
+    # ==== Plot de pérdidas ====
     ax[0].plot(epochs, final_curve_means['val_loss'], label='validation')
     ax[0].plot(epochs, final_curve_means['train_loss'], label='training')
-    # Removed fill_between as std is zero for a single run
+    ax[0].fill_between(epochs, 
+                       y1=final_curve_means["val_loss"] - final_curve_stds["val_loss"], 
+                       y2=final_curve_means["val_loss"] + final_curve_stds["val_loss"], alpha=.5)
+    ax[0].fill_between(epochs, 
+                       y1=final_curve_means["train_loss"] - final_curve_stds["train_loss"], 
+                       y2=final_curve_means["train_loss"] + final_curve_stds["train_loss"], alpha=.5)
     ax[0].set_xlabel('Epoch')
     ax[0].set_ylabel('Loss')
     ax[0].set_title('Loss evolution during training')
     ax[0].legend()
 
+    # ==== Plot de precisión ====
     ax[1].plot(epochs, final_curve_means['val_acc'], label='validation')
     ax[1].plot(epochs, final_curve_means['train_acc'], label='training')
-    # Removed fill_between as std is zero for a single run
+    ax[1].fill_between(epochs, 
+                       y1=final_curve_means["val_acc"] - final_curve_stds["val_acc"], 
+                       y2=final_curve_means["val_acc"] + final_curve_stds["val_acc"], alpha=.5)
+    ax[1].fill_between(epochs, 
+                       y1=final_curve_means["train_acc"] - final_curve_stds["train_acc"], 
+                       y2=final_curve_means["train_acc"] + final_curve_stds["train_acc"], alpha=.5)
     ax[1].set_xlabel('Epoch')
     ax[1].set_ylabel('Accuracy')
     ax[1].set_title('Accuracy evolution during training')
     ax[1].legend()
 
-    plt.show()
+    fig.suptitle(suptitle, fontsize=16, weight="bold")
+
+    # ==== Guardar y cerrar ====
+    filepath = os.path.join('img', f'{suptitle}.pdf')
+    plt.savefig(filepath, bbox_inches='tight', format='pdf')
+    plt.close(fig)  
+
+
+def get_metrics_and_confusion_matrix(models, dataset, name=''):
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=min(16, len(dataset)))
+
+    # === Obtener etiquetas verdaderas ===
+    y_true = []
+    for _, y in dataloader:
+        y_true.append(y)
+    y_true = torch.cat(y_true)
+    n_classes = len(torch.unique(y_true))
+
+    # === Definir labels de clases ===
+    # Si el dataset tiene atributo label_to_idx o idx_to_label, lo usamos
+    if hasattr(dataset, 'idx_to_label'):
+        labels = [dataset.idx_to_label[i] for i in range(n_classes)]
+    elif hasattr(dataset, 'labels'):
+        labels = dataset.labels
+    else:
+        labels = [str(i) for i in range(n_classes)]
+
+    # === Calcular matrices de confusión ===
+    cms = []
+    for model in models:
+        model.cpu()
+        model.eval()
+        y_pred = []
+        for x, _ in dataloader:
+            y_pred.append(model(x).argmax(dim=1))
+        y_pred = torch.cat(y_pred)
+
+        cm = confusion_matrix(y_true, y_pred, labels=range(n_classes), normalize='true')
+        cms.append(cm)
+
+    cms = np.stack(cms)
+    cm_mean = cms.mean(axis=0)
+    cm_std = cms.std(axis=0)
+
+    # === Plot ===
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(cm_mean, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    ax.set(
+        xticks=np.arange(n_classes),
+        yticks=np.arange(n_classes),
+        xticklabels=labels,
+        yticklabels=labels,
+        ylabel='True label',
+        xlabel='Predicted label'
+    )
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    # === Texto: mean ± std ===
+    fmt = lambda m, s: f"{m:.2f}\n±{s:.2f}"
+    thresh = 0.5
+    for i in range(n_classes):
+        for j in range(n_classes):
+            ax.text(j, i, fmt(cm_mean[i, j], cm_std[i, j]),
+                    ha="center", va="center",
+                    color="white" if cm_mean[i, j] > thresh else "black")
+
+    # === Accuracy promedio ===
+    accs = []
+    for model in models:
+        y_pred = []
+        for x, _ in dataloader:
+            y_pred.append(model(x).argmax(dim=1))
+        y_pred = torch.cat(y_pred)
+        accs.append(accuracy_score(y_true, y_pred))
+
+    ax.set_title(rf'{name}, mean acc = {np.mean(accs)*100:.2f} ± {np.std(accs)*100:.2f}%')
+    plt.tight_layout()
+
+    os.makedirs('img', exist_ok=True)
+    filepath = os.path.join('img', f'conf_mat_{name}.pdf')
+    plt.savefig(filepath, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Confusion matrix saved to {filepath}")
 
 def evaluate_with_std(model, dataloader, criterion, use_gpu=True):
     # jaja std
@@ -195,31 +289,6 @@ def evaluate_with_std(model, dataloader, criterion, use_gpu=True):
 
     return mean_acc, std_acc, mean_loss, std_loss
 
-def confusion_matrix(model, dataloader, num_classes, use_gpu = True):
-    confusion_matrix = torch.zeros(num_classes, num_classes)
-    model.eval()
-    with torch.no_grad():
-        for X, y in dataloader:
-            if use_gpu:
-                X, y = X.cuda(), y.cuda()
-            outputs = model(X)
-            _, preds = torch.max(outputs, 1)
-            for t, p in zip(y.view(-1), preds.view(-1)):
-                confusion_matrix[t.long(), p.long()] += 1
-    return confusion_matrix
-
-def confusion_matrix_display(tags, models, test_loader, class_names, use_gpu=True):
-    for name, model in zip(tags, models):
-        cm = confusion_matrix(model, test_loader, len(class_names), use_gpu)
-        cm_np = cm.cpu().numpy()
-
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(cm_np, annot=True, fmt=".0f", cmap="Blues",
-                    xticklabels=class_names, yticklabels=class_names)
-        plt.xlabel('Predicted')
-        plt.ylabel('True')
-        plt.title(f'Confusion Matrix - {name}')
-        plt.show()
 
 
 def evaluate_models_metrics(models, dataloader, criterion, use_gpu=True):
