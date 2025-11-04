@@ -1,4 +1,13 @@
+# %%
+import os
+import torchaudio
+from torch import nn
 import torch
+from tqdm import tqdm
+from torch.utils.data import Dataset
+import torch.nn.functional as F
+from random import randint
+
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,6 +16,211 @@ from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_sc
 import os
 import re
 
+
+
+# %% [markdown]
+# ## Datasets
+
+# %%
+
+class CustomSpeechCommands(Dataset):
+    def __init__(self, root, files_list, download=False, target_len=16000):
+        """
+        root: directorio raíz del dataset
+        files_list: archivo con lista de paths (train/val/test)
+        download: True para descargar dataset si no existe
+        target_len: duración fija en muestras (16000 = 1s)
+        """
+        self.target_len = target_len
+        self.dataset = torchaudio.datasets.SPEECHCOMMANDS(
+            root=root, 
+            download=download
+        )
+        self.indices = None
+        self.splitter(files_list, root)
+        # self.OFFICIAL_CLASSES = [
+        # "yes", "no", "up", "down", "left", "right",
+        # "on", "off", "stop", "go"
+        # ]
+
+    def splitter(self, files_list, root):
+        with open(files_list, 'r') as f:
+            self.file_paths = [line.strip() for line in f.readlines()]
+        
+        self.all_paths = []
+        for item in tqdm(self.dataset._walker, desc=f"Splitting {files_list}"):
+            full_path = item
+            relative_path = os.path.relpath(
+                full_path, 
+                start=os.path.join(root, "SpeechCommands", "speech_commands_v0.02")
+            )
+            relative_path = relative_path.replace("\\", "/")
+            self.all_paths.append(relative_path)
+
+        self.indices = [
+            i for i, path in enumerate(self.all_paths) 
+            if path in self.file_paths
+        ]
+
+        print(f"Total archivos en dataset: {len(self.all_paths)}")
+        print(f"Archivos en {files_list}: {len(self.file_paths)}")
+        print(f"Archivos encontrados: {len(self.indices)}")
+
+    def pad_waveform(self, waveform):
+        """
+        Aplica zero padding (o recorte) para dejar todas las señales del mismo largo.
+        """
+        length = waveform.shape[-1]
+        if length < self.target_len:
+            pad_amt = self.target_len - length
+            waveform = F.pad(waveform, (0, pad_amt))
+        elif length > self.target_len:
+            waveform = waveform[:, :self.target_len]
+        return waveform
+
+    def extract_features(self, feature_extractor, device="cpu"):
+        """
+        Extrae características (MFCC u otras) aplicando zero padding en el waveform.
+        Devuelve:
+          - features: tensor N x C x T
+          - labels: lista de strings
+        """
+        features = []
+        labels = []
+
+        feature_extractor.to(device)
+
+        with torch.no_grad():
+            for idx in tqdm(self.indices, desc="Extrayendo features"):
+                waveform, sample_rate, label, _, _ = self.dataset[idx]
+
+                # padding antes del extractor
+                waveform = self.pad_waveform(waveform).to(device)
+
+                feat = feature_extractor(waveform).squeeze(0).cpu()
+                feat = feat.transpose(0, 1)  # [T, n_mfcc] -> ahora input_size=13
+                features.append(feat)
+                labels.append(label)
+
+        # Convertir a tensor (todas las secuencias tienen igual longitud ahora)
+        features = torch.stack(features)
+        print(f"Features tensor: {features.shape}")  # [N, n_mfcc, T]
+        return features, labels
+
+
+    def save_features(self, feature_extractor, save_path, device="cpu"):
+        """
+        Extrae y guarda features, reemplazando clases no oficiales por 'unknown'.
+        """
+        print(f"Guardando features en: {save_path}")
+        try:
+            features, labels = self.extract_features(feature_extractor, device=device)
+            # processed_labels = [
+            #     label if label in self.OFFICIAL_CLASSES else "unknown"
+            #     for label in labels
+            # ]
+            torch.save({"features": features, "labels": labels}, save_path)
+            print(f"Features guardadas correctamente en {save_path}")
+            print(f"Clases finales: {set(labels)}")
+
+        except Exception as e:
+            print(f"Error al guardar features en {save_path}: {e}")
+
+    def __len__(self):
+        return len(self.indices)
+    
+    def __getitem__(self, idx):
+        original_idx = self.indices[idx]
+        waveform, sample_rate, label, speaker_id, utterance_number = self.dataset[original_idx]
+        waveform = self.pad_waveform(waveform)
+        return waveform, sample_rate, label, speaker_id, utterance_number
+
+class FeaturesDataset(Dataset):
+    def __init__(self, features_path):
+        """
+        Carga un archivo .pt con 'features' y 'labels' previamente guardados.
+
+        features_path: ruta al archivo .pt (por ejemplo 'data/train.pt')
+        """
+        data = torch.load(features_path)
+        self.features = data["features"]
+        self.labels = data["labels"]
+
+        # Crear diccionario para pasar de string a índice (útil para entrenar)
+        self.label_to_idx = {label: i for i, label in enumerate(sorted(set(self.labels)))}
+        self.idx_to_label = {v: k for k, v in self.label_to_idx.items()}
+        self.numeric_labels = torch.tensor([self.label_to_idx[l] for l in self.labels])
+
+        print(f"Dataset cargado desde {features_path}")
+        print(f" - {len(self.features)} ejemplos")
+        print(f" - {len(self.label_to_idx)} clases")
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        feature = self.features[idx]
+        label = self.numeric_labels[idx]
+        return feature, label
+
+# %% [markdown]
+# ## Models
+
+# %%
+class RNNModel(nn.Module):
+    def __init__(
+        self,
+        rnn_type,
+        n_input_channels,
+        hidd_size=256,
+        out_features = 35,
+        num_layers=1,
+    ):
+        """
+        Para utilizar una vanilla RNN entregue rnn_type="RNN"
+        Para utilizar una LSTM entregue rnn_type="LSTM"
+        Para utilizar una GRU entregue rnn_type="GRU"
+        """
+        super().__init__()
+
+        self.rnn_type = rnn_type
+
+        if rnn_type == "GRU":
+            self.rnn_layer = nn.GRU(n_input_channels, hidd_size, batch_first=True, num_layers=num_layers)
+
+        elif rnn_type == "LSTM":
+            self.rnn_layer = nn.LSTM(n_input_channels, hidd_size, batch_first=True, num_layers=num_layers)
+
+        elif rnn_type == "RNN":
+            self.rnn_layer = nn.RNN(n_input_channels, hidd_size, batch_first=True, num_layers=num_layers, bidirectional=True)
+
+        else:
+            raise ValueError(f"rnn_type {rnn_type} not supported.")
+
+        self.net = nn.Sequential(
+            nn.Linear(hidd_size, out_features),
+        )
+
+        self.flatten_layer = nn.Flatten()
+
+    def forward(self, x):
+        if self.rnn_type == "GRU":
+            out, h = self.rnn_layer(x)
+
+        elif self.rnn_type == "LSTM":
+            out, (h, c) = self.rnn_layer(x)
+
+        elif self.rnn_type == "RNN":
+            out, h = self.rnn_layer(x)
+
+        out = h[-1]
+
+        return self.net(out)
+
+# %% [markdown]
+# ## Trainers
+
+# %%
 def train_step(x_batch, y_batch, model, optimizer, criterion, use_gpu):
     # Predicción
     y_predicted = model(x_batch)
@@ -180,7 +394,6 @@ def show_curves(all_curves, suptitle=''):
     plt.savefig(filepath, bbox_inches='tight', format='pdf')
     plt.close(fig)  
 
-
 def get_metrics_and_confusion_matrix(models, dataset, name=''):
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=min(16, len(dataset)))
 
@@ -191,8 +404,7 @@ def get_metrics_and_confusion_matrix(models, dataset, name=''):
     y_true = torch.cat(y_true)
     n_classes = len(torch.unique(y_true))
 
-    # === Definir labels de clases ===
-    # Si el dataset tiene atributo label_to_idx o idx_to_label, lo usamos
+    # === Definir labels ===
     if hasattr(dataset, 'idx_to_label'):
         labels = [dataset.idx_to_label[i] for i in range(n_classes)]
     elif hasattr(dataset, 'labels'):
@@ -217,30 +429,6 @@ def get_metrics_and_confusion_matrix(models, dataset, name=''):
     cm_mean = cms.mean(axis=0)
     cm_std = cms.std(axis=0)
 
-    # === Plot ===
-    fig, ax = plt.subplots(figsize=(8, 8))
-    im = ax.imshow(cm_mean, interpolation='nearest', cmap=plt.cm.Blues)
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    ax.set(
-        xticks=np.arange(n_classes),
-        yticks=np.arange(n_classes),
-        xticklabels=labels,
-        yticklabels=labels,
-        ylabel='True label',
-        xlabel='Predicted label'
-    )
-    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-
-    # === Texto: mean ± std ===
-    fmt = lambda m, s: f"{m:.2f}\n±{s:.2f}"
-    thresh = 0.5
-    for i in range(n_classes):
-        for j in range(n_classes):
-            ax.text(j, i, fmt(cm_mean[i, j], cm_std[i, j]),
-                    ha="center", va="center",
-                    color="white" if cm_mean[i, j] > thresh else "black")
-
     # === Accuracy promedio ===
     accs = []
     for model in models:
@@ -250,14 +438,44 @@ def get_metrics_and_confusion_matrix(models, dataset, name=''):
         y_pred = torch.cat(y_pred)
         accs.append(accuracy_score(y_true, y_pred))
 
-    ax.set_title(rf'{name}, mean acc = {np.mean(accs)*100:.2f} ± {np.std(accs)*100:.2f}%')
-    plt.tight_layout()
+    acc_mean = np.mean(accs) * 100
+    acc_std = np.std(accs) * 100
 
+    # === Figura combinada ===
     os.makedirs('img', exist_ok=True)
+    fig, axs = plt.subplots(1, 2, figsize=(14, 6))
+
+    # --- Subplot 1: medias ---
+    im1 = axs[0].imshow(cm_mean, interpolation='nearest', cmap=plt.cm.Blues)
+    axs[0].set_title('Mean Confusion Matrix')
+    axs[0].set_xlabel('Predicted label')
+    axs[0].set_ylabel('True label')
+    axs[0].set_xticks(np.arange(n_classes))
+    axs[0].set_yticks(np.arange(n_classes))
+    axs[0].set_xticklabels(labels, rotation=45, ha="right", rotation_mode="anchor")
+    axs[0].set_yticklabels(labels)
+    fig.colorbar(im1, ax=axs[0], fraction=0.046, pad=0.04)
+
+    # --- Subplot 2: desviaciones estándar ---
+    im2 = axs[1].imshow(cm_std, interpolation='nearest', cmap=plt.cm.Oranges)
+    axs[1].set_title('Standard Deviation')
+    axs[1].set_xlabel('Predicted label')
+    axs[1].set_ylabel('True label')
+    axs[1].set_xticks(np.arange(n_classes))
+    axs[1].set_yticks(np.arange(n_classes))
+    axs[1].set_xticklabels(labels, rotation=45, ha="right", rotation_mode="anchor")
+    axs[1].set_yticklabels(labels)
+    fig.colorbar(im2, ax=axs[1], fraction=0.046, pad=0.04)
+
+    # --- Título general ---
+    fig.suptitle(rf'{name}, mean acc = {acc_mean:.2f} ± {acc_std:.2f}%', fontsize=12)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
     filepath = os.path.join('img', f'conf_mat_{name}.pdf')
     plt.savefig(filepath, bbox_inches='tight')
     plt.close(fig)
-    print(f"Confusion matrix saved to {filepath}")
+
+    print(f"Combined confusion matrix (mean + std) saved to {filepath}")
 
 def evaluate_with_std(model, dataloader, criterion, use_gpu=True):
     # jaja std
@@ -362,7 +580,7 @@ def evaluate_models_metrics(models, dataloader, criterion, use_gpu=True):
     # return metrics_mean, metrics_std, all_metrics
     return
 
-def nfft_hop_length_exp(n_trains, feature_xtractor):
+def nfft_hop_length_exp(n_trains, feature_xtractor, batch_size, lr, epochs, criterion, use_gpu = True):
     
     # ======== Estructuras de resultados ========
     results = {}  # {(nfft, hl): [accuracies]}
@@ -448,8 +666,145 @@ def nfft_hop_length_exp(n_trains, feature_xtractor):
             std_val  = std_matrix[i, j]
             if not np.isnan(mean_val):
                 color = 'white' if mean_val < 0.7 else 'black'
-                plt.text(j, i, f"{mean_val:.2f}\n+/-{std_val:.4f}", 
-                        ha='center', va='center', color=color, fontsize=8)
+                plt.text(j, i, f"+/-{std_val:.4f}", 
+                        ha='center', va='center', color=color, fontsize=6)
 
     plt.tight_layout()
     plt.show()
+
+# %% [markdown]
+# ## Visualization
+
+# %%
+def plot_waveform(wf, sample_rate, label="", figname=None):
+    """
+    Muestra el waveform (izquierda) y los MFCCs (derecha) de una señal de audio.
+
+    Parámetros:
+        wf (Tensor): señal de audio [1, N] o [N]
+        sample_rate (int): frecuencia de muestreo (Hz)
+        label (str): etiqueta opcional para el título
+        figname (str): ruta para guardar la figura (si es None, solo muestra)
+    """
+    if isinstance(wf, torch.Tensor):
+        wf = wf.squeeze().cpu()
+
+    # === Transformación MFCC ===
+    mfcc_transform = torchaudio.transforms.MFCC(
+        sample_rate=sample_rate,
+        n_mfcc=13,
+        melkwargs={"n_fft": 320, "hop_length": 160, "n_mels": 23},
+        log_mels=True
+    )
+    mfcc = mfcc_transform(wf.unsqueeze(0)).squeeze().cpu().numpy()  # [n_mfcc, time]
+
+    # === Crear figura con 2 subplots ===
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    sns.set_style("whitegrid")
+
+    # --- Waveform ---
+    time = torch.arange(0, len(wf)) / sample_rate
+    axes[0].plot(time, wf.numpy(), color="steelblue", linewidth=1.0)
+    axes[0].set_title("Waveform", fontsize=12)
+    axes[0].set_xlabel("Tiempo [s]")
+    axes[0].set_ylabel("Amplitud")
+
+    # --- MFCC ---
+    sns.heatmap(mfcc, ax=axes[1], cmap="viridis", cbar=True)
+    axes[1].set_title("MFCCs", fontsize=12)
+    axes[1].set_xlabel("Tiempo (frames)")
+    axes[1].set_ylabel("Coeficiente MFCC")
+
+    fig.suptitle(f"Audio: {label}", fontsize=14, y=1.02)
+    plt.tight_layout()
+
+    # === Guardar o mostrar ===
+    if figname:
+        name = os.path.join('img', f'{figname}.pdf')
+        plt.savefig(name, bbox_inches="tight")
+        print(f"Figura guardada en {name}")
+    else:
+        plt.show()
+
+    plt.close(fig)
+
+
+# %% [markdown]
+# ## Feature extraction
+
+# %%
+# ==== Paths ====
+ROOT_DIR = 'data'
+train_pt = os.path.join(ROOT_DIR, 'train.pt')
+val_pt = os.path.join(ROOT_DIR, 'val.pt')
+test_pt = os.path.join(ROOT_DIR, 'test.pt')
+TRAIN_LIST = os.path.join(ROOT_DIR,"train_list.txt")
+VAL_LIST = os.path.join(ROOT_DIR, "val_list.txt")
+TEST_LIST = os.path.join(ROOT_DIR, "test_list.txt")
+
+if not os.path.isfile(train_pt):
+    train_raw = CustomSpeechCommands(ROOT_DIR, TRAIN_LIST)
+    val_raw = CustomSpeechCommands(ROOT_DIR, VAL_LIST)
+    test_raw = CustomSpeechCommands(ROOT_DIR, TEST_LIST)
+    mfcc_transform = torchaudio.transforms.MFCC(
+        sample_rate=16000,
+        n_mfcc=13, # número de coeficientes MFCC a extraer
+        melkwargs={"n_fft": 320, "hop_length": 160, "n_mels": 23}, # 320 = 20ms, 160 = 10ms, 23 = número de filtros mel
+        log_mels = True
+    )
+    train_raw.save_features(mfcc_transform, train_pt)
+    test_raw.save_features(mfcc_transform, test_pt)
+    val_raw.save_features(mfcc_transform, val_pt)
+
+train_dataset = FeaturesDataset(train_pt)
+test_dataset = FeaturesDataset(test_pt)
+val_dataset = FeaturesDataset(val_pt)
+
+
+print("¡Datasets cargados exitosamente!")
+print(f"Train samples: {len(train_dataset)}")
+print(f"Validation samples: {len(val_dataset)}")
+print(f"Test samples: {len(test_dataset)}")
+
+# %%
+
+# random_idx = randint(0, len(test_raw))
+# waveform, sample_rate, label, *_ = test_raw[random_idx]
+
+# plot_waveform(waveform, sample_rate, label, figname=f'{label}_waveform_and_MFCC')
+
+
+# %% [markdown]
+# # Entrenamiento
+
+# %%
+print(train_dataset.features.shape)
+
+# %%
+# Preliminary testing
+lr = 5e-4
+batch_size = 32
+criterion = nn.CrossEntropyLoss()
+n_trains = 2
+epochs = 2
+
+for arch in ['GRU', 'LSTM', 'RNN']:
+    print(f'Entrenando Modelo {arch}')
+    times_of_training = []
+    models = []
+    curves = []
+    for k in range(n_trains):
+        print(f'Entrenando modelo {k}/{n_trains}')
+        model = RNNModel(rnn_type = arch, n_input_channels=13) # puede ser que sea util estudiar el hidden size, o sea reducirlo hasta que comience a afectar el rendimiento del modelo en val
+        all_curves, times = train_model(model, train_dataset, val_dataset, epochs, criterion, batch_size, lr, n_evaluations_per_epoch=3, use_gpu=True)
+        curves.append(all_curves)
+        times_of_training.append(times)
+        models.append(model)
+    show_curves(curves, arch)
+    get_metrics_and_confusion_matrix(models, test_dataset, arch)
+
+
+# %%
+
+
+
