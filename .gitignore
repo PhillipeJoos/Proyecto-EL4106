@@ -7,7 +7,7 @@ test.txt
 main_exported.py
 proyecto/
 .vscode
-
+features_log.txt
 # Datasets
 data/test_features.pkl
 data/val_features.pkl
